@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, notInArray, or, sql } 
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agentFailureState,
   agentWakeupRequests,
   agents,
   approvals,
@@ -3039,6 +3040,17 @@ export function issueService(db: Db) {
               })
               .where(eq(executionWorkspaces.id, workspace.id));
           }
+        }
+
+        // Clear auto-issue slot when adapter-failure issue reaches terminal state
+        const becameTerminal =
+          !["done", "cancelled"].includes(existing.status) &&
+          (updated.status === "done" || updated.status === "cancelled");
+        if (becameTerminal && existing.idempotencyKey?.startsWith("auto-adapter-failure:")) {
+          await tx
+            .update(agentFailureState)
+            .set({ openAutoIssueId: null, updatedAt: new Date() })
+            .where(eq(agentFailureState.openAutoIssueId, updated.id));
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
