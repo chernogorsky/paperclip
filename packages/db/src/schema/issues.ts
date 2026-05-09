@@ -143,5 +143,13 @@ export const issues = pgTable(
     adapterFailureIdempotencyIdx: uniqueIndex("issues_adapter_failure_idempotency_uq")
       .on(table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'auto-adapter-failure:%'`),
+    activeAdapterFailureIdx: uniqueIndex("issues_active_adapter_failure_uq")
+      .on(table.companyId, table.originKind, table.originId, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'adapter_failure'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
   }),
 );

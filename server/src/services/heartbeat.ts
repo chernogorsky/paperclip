@@ -7675,6 +7675,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status,
         errorCode: runErrorCode,
         errorMessage: runErrorMessage,
+        errorFamily: adapterResult.errorFamily ?? null,
       }).catch((hookErr) => {
         logger.warn({ err: hookErr, runId: run.id }, "adapter-failure-hook: post-run hook failed (non-fatal)");
       });
@@ -7763,6 +7764,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: "failed",
         errorCode: "adapter_failed",
         errorMessage: message,
+        errorFamily: null,
       }).catch((hookErr) => {
         logger.warn({ err: hookErr, runId: run.id }, "adapter-failure-hook: post-run hook failed (non-fatal)");
       });
@@ -7816,6 +7818,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: "failed",
             errorCode: "adapter_failed",
             errorMessage: message,
+            errorFamily: null,
           }).catch(() => undefined);
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);

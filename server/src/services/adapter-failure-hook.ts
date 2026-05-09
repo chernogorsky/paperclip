@@ -4,10 +4,12 @@ import type { Db } from "@paperclipai/db";
 import { agentFailureState, agents, companies, labels, heartbeatRuns, issues } from "@paperclipai/db";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { getTelemetryClient } from "../telemetry.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { issueService } from "./issues.js";
 
 const ADAPTER_FAILURE_THRESHOLD = 2;
+const AUTO_CLOSE_SUCCESS_THRESHOLD = 3;
 const FALLBACK_LABEL_NAME = "unassigned-platform-fallback";
 
 export interface AdapterFailureHookInput {
@@ -17,6 +19,7 @@ export interface AdapterFailureHookInput {
   status: string;
   errorCode: string | null;
   errorMessage: string | null;
+  errorFamily?: string | null;
 }
 
 interface CreateDecision {
@@ -27,11 +30,27 @@ interface CreateDecision {
   idempotencyKey: string;
 }
 
-interface SkipDecision {
-  kind: "reset" | "noop" | "skipped_idempotent";
+interface AutoCloseDecision {
+  kind: "auto_close";
+  counter: number;
+  consecutiveSuccesses: number;
+  openAutoIssueId: string;
 }
 
-type HookDecision = CreateDecision | SkipDecision;
+interface AppendCommentDecision {
+  kind: "append_comment";
+  counter: number;
+  existingIssueId: string;
+  firstFailureRunId: string;
+  lastFailureRunId: string;
+}
+
+interface SkipDecision {
+  kind: "reset" | "noop" | "skipped_idempotent";
+  counter: number;
+}
+
+type HookDecision = CreateDecision | AutoCloseDecision | AppendCommentDecision | SkipDecision;
 
 export function adapterFailureHookService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
@@ -164,8 +183,8 @@ export function adapterFailureHookService(db: Db) {
     return db.transaction(async (tx) => {
       // Ensure the row exists (no-op if already present), then lock it.
       await tx.execute(sql`
-        INSERT INTO agent_failure_state (agent_id, consecutive_adapter_failures, updated_at)
-        VALUES (${input.agentId}, 0, now())
+        INSERT INTO agent_failure_state (agent_id, consecutive_adapter_failures, consecutive_successes, updated_at)
+        VALUES (${input.agentId}, 0, 0, now())
         ON CONFLICT (agent_id) DO NOTHING
       `);
       await tx.execute(
@@ -179,30 +198,96 @@ export function adapterFailureHookService(db: Db) {
       const stateRow = rows[0]!;
 
       if (!isAdapterFailed) {
-        if (stateRow.consecutiveAdapterFailures === 0) {
-          return { kind: "noop" } as SkipDecision;
+        const hasOpenIssue = stateRow.openAutoIssueId !== null;
+        const hadFailures = stateRow.consecutiveAdapterFailures > 0;
+
+        if (!hasOpenIssue && !hadFailures) {
+          return { kind: "noop", counter: 0 } as SkipDecision;
         }
+
+        const newSuccessCount = stateRow.consecutiveSuccesses + 1;
+
+        if (hasOpenIssue && newSuccessCount >= AUTO_CLOSE_SUCCESS_THRESHOLD) {
+          await tx
+            .update(agentFailureState)
+            .set({
+              consecutiveAdapterFailures: 0,
+              consecutiveSuccesses: 0,
+              firstFailureRunId: null,
+              lastFailureRunId: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentFailureState.agentId, input.agentId));
+
+          return {
+            kind: "auto_close",
+            counter: 0,
+            consecutiveSuccesses: newSuccessCount,
+            openAutoIssueId: stateRow.openAutoIssueId!,
+          } as AutoCloseDecision;
+        }
+
         await tx
           .update(agentFailureState)
           .set({
             consecutiveAdapterFailures: 0,
+            consecutiveSuccesses: hasOpenIssue ? newSuccessCount : 0,
             firstFailureRunId: null,
             lastFailureRunId: null,
             updatedAt: new Date(),
           })
           .where(eq(agentFailureState.agentId, input.agentId));
-        return { kind: "reset" } as SkipDecision;
+        return { kind: "reset", counter: 0 } as SkipDecision;
       }
 
       const newCounter = stateRow.consecutiveAdapterFailures + 1;
       const firstFailureRunId = stateRow.firstFailureRunId ?? input.runId;
 
       if (newCounter >= ADAPTER_FAILURE_THRESHOLD && stateRow.openAutoIssueId === null) {
+        const errorFamily = input.errorFamily ?? "default";
+
+        const existingIssues = await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, input.companyId),
+              eq(issues.originKind, "adapter_failure"),
+              eq(issues.originId, input.agentId),
+              eq(issues.originFingerprint, errorFamily),
+              sql`${issues.hiddenAt} is null`,
+              sql`${issues.status} not in ('done', 'cancelled')`,
+            ),
+          );
+        const existingIssue = existingIssues[0] ?? null;
+
+        if (existingIssue) {
+          await tx
+            .update(agentFailureState)
+            .set({
+              consecutiveAdapterFailures: newCounter,
+              consecutiveSuccesses: 0,
+              firstFailureRunId,
+              lastFailureRunId: input.runId,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentFailureState.agentId, input.agentId));
+
+          return {
+            kind: "append_comment",
+            counter: newCounter,
+            existingIssueId: existingIssue.id,
+            firstFailureRunId,
+            lastFailureRunId: input.runId,
+          } as AppendCommentDecision;
+        }
+
         const idempotencyKey = `auto-adapter-failure:${input.agentId}:${firstFailureRunId}`;
         await tx
           .update(agentFailureState)
           .set({
             consecutiveAdapterFailures: newCounter,
+            consecutiveSuccesses: 0,
             firstFailureRunId,
             lastFailureRunId: input.runId,
             openAutoIssueId: sql`gen_random_uuid()`,
@@ -223,13 +308,17 @@ export function adapterFailureHookService(db: Db) {
         .update(agentFailureState)
         .set({
           consecutiveAdapterFailures: newCounter,
+          consecutiveSuccesses: 0,
           firstFailureRunId,
           lastFailureRunId: input.runId,
           updatedAt: new Date(),
         })
         .where(eq(agentFailureState.agentId, input.agentId));
 
-      return { kind: stateRow.openAutoIssueId ? "skipped_idempotent" : "noop" } as SkipDecision;
+      return {
+        kind: stateRow.openAutoIssueId ? "skipped_idempotent" : "noop",
+        counter: newCounter,
+      } as SkipDecision;
     });
   }
 
@@ -299,6 +388,8 @@ export function adapterFailureHookService(db: Db) {
       adapterConfig: agent.adapterConfig,
     });
 
+    const provider = String(agent.adapterConfig?.provider ?? agent.adapterType ?? "unknown");
+
     const createdIssue = await issuesSvc.create(input.companyId, {
       title: `Adapter failure: ${agent.name} (${decision.counter} consecutive runs)`,
       status: "todo",
@@ -308,12 +399,51 @@ export function adapterFailureHookService(db: Db) {
       labelIds,
       idempotencyKey: decision.idempotencyKey,
       description,
+      originKind: "adapter_failure",
+      originId: input.agentId,
+      originFingerprint: input.errorFamily ?? "default",
     });
 
     await db
       .update(agentFailureState)
       .set({ openAutoIssueId: createdIssue.id, updatedAt: new Date() })
       .where(eq(agentFailureState.agentId, input.agentId));
+
+    const telemetry = getTelemetryClient();
+    if (telemetry) {
+      telemetry.track("agent.adapter_failure.auto_issue_created", {
+        agent_id: input.agentId,
+        provider,
+      });
+    }
+  }
+
+  async function autoCloseIssue(input: AdapterFailureHookInput, decision: AutoCloseDecision): Promise<void> {
+    await issuesSvc.addComment(
+      decision.openAutoIssueId,
+      `Auto-closed: ${decision.consecutiveSuccesses} consecutive successful runs detected. The adapter issue appears resolved.`,
+      {},
+    );
+
+    await issuesSvc.update(decision.openAutoIssueId, { status: "done" });
+    await clearSlotOnIssueClosed(decision.openAutoIssueId);
+
+    logger.info(
+      {
+        agentId: input.agentId,
+        runId: input.runId,
+        issueId: decision.openAutoIssueId,
+        consecutiveSuccesses: decision.consecutiveSuccesses,
+      },
+      "adapter-failure-hook: auto-closed issue after consecutive successes",
+    );
+
+    const telemetry = getTelemetryClient();
+    if (telemetry) {
+      telemetry.track("agent.adapter_failure.auto_issue_closed", {
+        agent_id: input.agentId,
+      });
+    }
   }
 
   async function executeHook(input: AdapterFailureHookInput): Promise<void> {
@@ -323,9 +453,57 @@ export function adapterFailureHookService(db: Db) {
     const decision = await updateFailureState(input);
 
     logger.info(
-      { agentId: input.agentId, runId: input.runId, decision: decision.kind },
+      {
+        agentId: input.agentId,
+        runId: input.runId,
+        counter: decision.counter,
+        decision: decision.kind,
+      },
       "adapter-failure-hook",
     );
+
+    const telemetry = getTelemetryClient();
+    if (telemetry) {
+      telemetry.track("agent.adapter_failure.consecutive_count", {
+        agent_id: input.agentId,
+        count: decision.counter,
+      });
+    }
+
+    if (decision.kind === "auto_close") {
+      try {
+        await autoCloseIssue(input, decision);
+      } catch (err: unknown) {
+        logger.error(
+          { err, agentId: input.agentId, runId: input.runId, issueId: decision.openAutoIssueId },
+          "adapter-failure-hook: failed to auto-close issue",
+        );
+      }
+    }
+
+    if (decision.kind === "append_comment") {
+      try {
+        await issuesSvc.addComment(
+          decision.existingIssueId,
+          `Adapter failure recurring: ${decision.counter} consecutive runs as of ${new Date().toISOString()}.`,
+          {},
+        );
+        await db
+          .update(agentFailureState)
+          .set({ openAutoIssueId: decision.existingIssueId, updatedAt: new Date() })
+          .where(eq(agentFailureState.agentId, input.agentId));
+
+        logger.info(
+          { agentId: input.agentId, runId: input.runId, issueId: decision.existingIssueId, counter: decision.counter },
+          "adapter-failure-hook: appended comment to existing issue (dedup)",
+        );
+      } catch (err: unknown) {
+        logger.error(
+          { err, agentId: input.agentId, runId: input.runId, issueId: decision.existingIssueId },
+          "adapter-failure-hook: failed to append comment to existing issue",
+        );
+      }
+    }
 
     if (decision.kind === "create") {
       try {
